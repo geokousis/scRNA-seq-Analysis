@@ -1,0 +1,397 @@
+---
+title: "scRNA-seq"
+author: "Georgios Kousis Tsampazis"
+date: "`r Sys.Date()`"
+output: 
+  rmdformats::readthedown:
+    self_contained: true
+    thumbnails: false
+    lightbox: false
+    gallery: false
+    highlight: "tango"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Analysis of Peripheral Blood Mononuclear Cell (PBMC) scRNA-seq Data
+
+A comprehensive exploration of 10x Genomics PBMC3k single-cell RNA-seq data.  
+This notebook demonstrates a typical Seurat-based workflow, covering data download, quality control, normalisation, dimensionality reduction, clustering, and cell type annotation using marker genes.
+
+---
+
+## **Part 1:** Downloads
+
+* Install and load R package dependencies  
+* Download the PBMC3k raw count matrix from 10x Genomics  
+
+## **Part 2:** Preprocessing & Quality Control
+
+* Create a Seurat object from the raw count matrix  
+* Compute standard QC metrics (gene counts, UMI counts, mitochondrial percentage)  
+* Visualise QC metrics and filter out low-quality cells  
+
+## **Part 3:** Data Normalisation
+
+* Apply log-normalisation of gene expression  
+* Prepare the dataset for downstream dimensionality reduction  
+
+## **Part 4:** Dimensionality Reduction & Clustering
+
+* Identify highly variable genes  
+* Perform PCA and inspect principal components (loadings, heatmaps, elbow plot)  
+* Build a nearest-neighbour graph and run UMAP  
+* Explore the effect of varying the number of PCs and clustering resolution  
+
+## **Part 5:** Marker Detection & Cell Type Annotation
+
+* Perform differential expression to identify cluster-specific markers  
+* Construct a composite marker score (AUC × log₂ fold change × specificity)  
+* Select top markers per cluster and visualise their expression on UMAP  
+* Assign biological cell-type labels (e.g. Naive CD4 T, CD14⁺ Mono, NK/CD8 T, B cells, CD16⁺ Monocytes, Dendritic cells, Platelets) and validate with additional markers
+
+
+---
+
+# **Part 1**: Downloads
+
+This setup chunk begins by listing all required packages for our analysis. It then checks for any missing CRAN packages and installs them automatically. Finally, it attempts to load each package and stops with an error message if any fail to load.
+
+```{r Download_Dependencies}
+# List all required packages
+required_pkgs <- c(
+  "dplyr", "Seurat", "patchwork","DT","ggplot2"
+)
+
+cran_pkgs = required_pkgs
+
+# Find which CRAN packages are not yet installed
+new_cran = cran_pkgs[!(cran_pkgs %in% installed.packages()[, "Package"])]
+if (length(new_cran)) {
+  install.packages(new_cran, dependencies = TRUE)
+}
+
+# Load all packages (and throw an error if one fails to load)
+for (pkg in required_pkgs) {
+  success = suppressMessages(require(pkg, character.only = TRUE))
+  if (!success) {
+    stop(paste("Failed to load package:", pkg))
+  }
+}
+
+```
+
+This chunk creates a `.data_tmp_gkt` folder if needed, downloads `pbmc3k_filtered_gene_bc_matrices.tar.gz` from 10X Genomics into it and untar it.
+
+```{r Download Data}
+# Define the directory and file paths
+dir_name = ".data_tmp_gkt"
+file_name = "pbmc3k_filtered_gene_bc_matrices.tar.gz"
+file_url = "https://cf.10xgenomics.com/samples/cell/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz"
+file_path = file.path(dir_name, file_name)
+
+# Create the directory if it doesn't exist
+if (!dir.exists(dir_name)) {
+  dir.create(dir_name)
+}
+
+# Download the file
+download.file(url = file_url, destfile = file_path, mode = "wb")
+# Untar the downloaded file
+untar(file_path, exdir = dir_name)
+list.files(dir_name, recursive = TRUE)
+
+cat("File downloaded to:", file_path, "\n")
+```
+---
+
+# **Part 2**: Preprocessing & Quality Control
+
+## Preprocessing
+
+This chunk reads the Read10X dir into a PBMC data type (Seurat Object)
+```{r Open xlsx file}
+# Define the directory 
+data_dir = file.path(dir_name, "filtered_gene_bc_matrices", "hg19")
+pbmc.data = Read10X(data.dir = data_dir)
+pbmc = CreateSeuratObject(counts = pbmc.data, project = "pbmc3k", min.cells = 3, min.features = 200)
+```
+
+## QC
+```{r Quality Control}
+# Find percentage of reads that map to mitochondrial genome to determine low-quality/dying cells (high percentage will be filtered out)
+pbmc[["percent.mt"]] = PercentageFeatureSet(pbmc, pattern = "^MT-")
+```
+
+```{r DT-xlsx, message=FALSE}
+datatable(
+  pbmc@meta.data[1:20,],
+  options = list(
+    pageLength = 10,
+    autoWidth   = TRUE,
+    scrollX     = TRUE
+  ),
+  filter = 'top',
+  rownames = FALSE
+)
+```
+**Table 1. Cell-level metadata for PBMC3k dataset** *Table displaying the metadata for the first 20 QC-filtered cells in the PBMC3k object. Each row corresponds to a single cell, and columns include Seurat-derived metrics such as the number of detected genes (nFeature_RNA), total transcript counts (nCount_RNA), mitochondrial percentage (percent.mt).*
+
+```{r Visualize QC metrics}
+suppressWarnings( # Warnings were checked were defined non important (data formatting that doesn't interfie with the scope of the analysis), thus they are ignored for the sake of clarity
+  VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+)
+```
+**Figure 1. Qulity Control metrics on Peripheral Blood Mononuclear Cells scRNA-seq dataset** *Violin plots show the distribution of three standard QC metrics across cells: the number of detected genes per cell (nFeature_RNA), the total number of transcripts per cell (nCount_RNA), and the percentage of mitochondrial transcripts (percent.mt). Each black dot represents an individual cell. Most cells exhibit between 500–1500 detected genes and fewer than 5000 transcripts, with the majority of cells showing mitochondrial percentage below 5%. A subset of cells display unusually high feature or count values, indicative of potential doublets, while cells with elevated mitochondrial content may reflect stressed or dying cells. These QC measures provide a basis for filtering low-quality cells before downstream analysis.*
+
+```{r FeatureScatter}
+# Compute correlations and p-values
+cor1 = cor.test(pbmc$nCount_RNA, pbmc$percent.mt, method = "pearson")
+cor2 = cor.test(pbmc$nCount_RNA, pbmc$nFeature_RNA, method = "pearson")
+
+plot1 = FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt") +
+  ggtitle(paste0("r = ", round(cor1$estimate, 2), 
+                 ", p = ", signif(cor1$p.value, 3)))
+
+plot2 = FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA") +
+  ggtitle(paste0("r = ", round(cor2$estimate, 2), 
+                 ", p = ", signif(cor2$p.value, 3)))
+
+# Combine
+plot1 + plot2
+
+```
+**Figure 2. Feature–feature relationships in PBMC3k scRNA-seq dataset** *Scatter plots illustrate relationships between QC metrics. The left panel shows nCount_RNA versus percent.mt, with a weak but statistically significant negative correlation (r = –0.13, p = 3e–11). This indicates that cells with higher transcript counts do not systematically exhibit elevated mitochondrial percentages, instead, only a subset of cells shows high mitochondrial content, consistent with stressed or dying cells. The right panel shows nCount_RNA versus nFeature_RNA, with a strong positive correlation (r = 0.95, p=0), reflecting that cells with more transcripts also have more detected genes. This relationship is biologically expected and supports that the dataset behaves within normal biological assumptions, without evidence of systematic technical artifacts. Together, these results support applying mitochondrial percentage filtering to remove low-quality cells*
+
+
+Following the results from plots 1 and 2, cells with <200 or >2500 detected genes and those with mitochondrial percentage >5% will be excluded from further analysis. 
+
+```{r Filtering}
+pbmc_filtered = subset(pbmc, subset = nFeature_RNA > 200 & nFeature_RNA < 2500 & percent.mt < 5)
+```
+
+```{r Visualize QC metrics before and after, fig.height=12, fig.width=6}
+suppressWarnings({
+  # Before filtering
+  plot_before <- VlnPlot(
+    pbmc, 
+    features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+    ncol = 3
+  )
+  
+  # After filtering
+  plot_after <- VlnPlot(
+    pbmc_filtered, 
+    features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), 
+    ncol = 3
+  )
+})
+
+plot_before / plot_after
+```
+**Figure 3. QC metrics before and after filtering** *Violin plots showing nFeature_RNA, nCount_RNA, and percent.mt distributions in PBMC3k cells before (top row) and after (bottom row) QC filtering. Cells with fewer than 200 or more than 2500 detected genes (nFeature_RNA) were excluded. Although filtering was not directly applied to nCount_RNA, cells with extreme transcript counts were also removed due to their strong correlation with gene features (see figure 2). Low-quality cells with high mitochondrial percentages (>5%) were filtered out, resulting in a more balanced distribution mitochondrial percentage distribution.*
+
+Accept the filtering 
+```{r Filtering Accept}
+pbmc = pbmc_filtered
+```
+---
+
+# **Part 3**: Data Normalisation
+
+This chunk applies global-scaling normalization method “LogNormalize” that normalizes the feature expression measurements for each cell by the total expression, multiplies this by a scale factor of 10,000, and log-transforms the result. This approach relies on the strong assumption that all cells originally contained the same number of RNA molecules. While this assumption is unlikely to hold strictly true biologically, for the purposes of this exercise it is considered negligible. 
+```{r Normalization}
+pbmc = NormalizeData(pbmc, normalization.method = "LogNormalize", scale.factor = 10000) #Defaults but kept for clarity
+```
+
+---
+
+# **Part 4:** Dimensionality Reduction & Clustering
+
+## Variable Features
+This chunk calculate a subset of features that exhibit high cell-to-cell variation in the dataset (highly expressed in some cells, and lowly expressed in others).
+```{r  FindVariableFeatures , fig.height=8, fig.width=10}
+
+pbmc <- FindVariableFeatures(pbmc, selection.method = "vst", nfeatures = 2000)
+
+# Identify the 10 most highly variable genes
+top10 <- head(VariableFeatures(pbmc), 10)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(pbmc)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2          # side-by-side (or use plot1 / plot2 for stacked)
+
+```
+
+**Figure 4.Identification of highly variable genes in PBMC3k dataset** *Scatter plots show the relationship between average gene expression and standardized variance. Each point represents a gene, with the 2,000 most variable genes highlighted in red and non-variable genes in black. The left panel displays all variable features, while the right panel also highlights the top 10 most variable genes (e.g., PPBP, S100A9, LYZ, IGLL5).*
+
+## PCA
+### Scaling
+
+This chunk applies a linear transformation (‘scaling’) that is a standard pre-processing step prior to PCA and ohter dimensionality reduction methods.
+
+```{r PCA Scaling, message=FALSE, warning=FALSE, results='hide'}
+all.genes <- rownames(pbmc)
+pbmc <- ScaleData(pbmc, features = all.genes)
+```
+
+### PCA
+```{r PCA, message=FALSE, warning=FALSE}
+pbmc <- RunPCA(pbmc, features = VariableFeatures(object = pbmc))
+print(pbmc[["pca"]], dims = 1:5, nfeatures = 5)
+```
+```{r  Loadings , fig.height=5, fig.width=10}
+VizDimLoadings(pbmc, dims = 1:2, reduction = "pca")
+```
+**Figure 5.PCA loadings for the first two principal components** *Dot plots showing the genes with the strongest positive and negative loadings on PC1 (left) and PC2 (right). Each point represents a gene, and its position on the x-axis reflects how much it contributes to the corresponding component. PC1 is mainly driven by myeloid and platelet-associated markers (e.g. TYROBP, S100A8, S100A9), while PC2 separates B-cell markers (e.g. CD79A, MS4A1) from cytotoxic/NK cell markers (e.g. NKG7, GZMB). Together, these loadings highlight that the first two PCs capture major immune lineages within the PBMC dataset.*
+
+```{r  PCA_plot , fig.height=5, fig.width=8}
+DimPlot(pbmc, reduction = "pca") + NoLegend()
+```
+**Figure 6. PCA of PBMC3k cells in PC1–PC2 space** *Scatter plot showing each QC-filtered cell projected onto the first two principal components derived from the scaled expression matrix. Each point corresponds to a single cell, positioned according to its overall transcriptional profile along PC1 (x-axis) and PC2 (y-axis). The broad, partially separated clouds of points indicate underlying structure in the data, consistent with the presence of multiple immune cell populations.*
+
+```{r  Dimheatmap , fig.height=8, fig.width=8}
+DimHeatmap(pbmc, dims = 1, cells = 500, balanced = TRUE)
+```
+**Figure 7. Heatmap of gene expression along PC1** *Heatmap showing scaled expression of the top PC1-associated genes (rows) across a subset of cells ordered by their PC1 score (columns). High (yellow) and low (purple) expression patterns reveal a clear gradient, with myeloid/monocyte markers (e.g. CST3, TYROBP, LST1, S100A8/9) enriched on one side and T-cell–associated genes (e.g. MALAT1, LTB, IL7R, CD2, CD27) enriched on the other, illustrating how PC1 separates major immune programs in the PBMC dataset.*
+
+```{r  Dimheatmap_pcs_multi , fig.height=18, fig.width=14}
+DimHeatmap(pbmc, dims = 1:15, cells = 500, balanced = TRUE)
+```
+**Figure 8. Heatmaps of gene expression for the first 15 principal components** *Heatmaps showing scaled expression of the top genes associated with PCs 1–15. Early PCs display clear blocks of high and low expression, indicating coherent gene programs and major sources of biological variation, whereas later PCs show weaker structure, consistent with capturing more subtle or noise-like variation. This overview helps justify focusing on the first few PCs for downstream clustering and visualization.*
+
+```{r  Elbow Plot , fig.height=8, fig.width=8}
+ElbowPlot(pbmc)
+```
+**Figure 9. Elbow plot of principal components** *Scatter plot showing the standard deviation explained by the first 20 principal components. The steep drop across the first few PCs followed by a clear “elbow” around PC 10 suggests that the first ~10 components capture most of the structured variation in the dataset and are therefore used for downstream clustering and visualization.*
+
+### UMAP
+
+```{r UMAP_res, fig.width=14, fig.height=8}
+# helper function
+.run_umap = function(obj, dims_keep, res, seed = 7) {
+  suppressMessages(suppressWarnings({
+    obj = FindNeighbors(obj, dims = 1:dims_keep, verbose = FALSE)
+    obj = FindClusters(obj, resolution = res, verbose = FALSE)
+    set.seed(seed)
+    obj = RunUMAP(obj, dims = 1:dims_keep, verbose = FALSE)
+  }))
+  DimPlot(obj, reduction = "umap", label = TRUE) +
+    ggtitle(sprintf("dims = %d, res = %.1f", dims_keep, res))
+}
+
+# main function
+compare_umap=function(pbmc,
+                         res_vec  = c(0.3, 0.5, 0.8),
+                         dims_vec = c(5, 10, 15),
+                         fixed_dims = 10,
+                         fixed_res  = 0.3) {
+  # top row: resolution changes
+  top = lapply(res_vec, function(r)
+    .run_umap(pbmc, dims_keep = fixed_dims, res = r))
+  top_row = wrap_plots(top, ncol = length(res_vec))
+  # bottom row: dims changes
+  bottom = lapply(dims_vec, function(d)
+    .run_umap(pbmc, dims_keep = d, res = fixed_res))
+  bottom_row <- wrap_plots(bottom, ncol = length(dims_vec))
+
+  # combine
+  final_plot=top_row / bottom_row
+  print(final_plot)
+  invisible(final_plot)
+}
+compare_umap(pbmc)
+```
+**Figure 10. Effect of PCA dimensionality and clustering resolution on UMAP embeddings** *UMAP projections of PBMC3k cells colored by Seurat cluster identity under different parameter settings. Top row: the number of PCs is fixed at 10 while the clustering resolution increases from 0.3 to 0.8, revealing progressively finer subdivision of the main immune populations. Bottom row: the clustering resolution is fixed at 0.3 while the number of PCs used (5, 10, 15) changes, showing how including more dimensions can subtly alter cluster shape and separation. Taken together, these comparisons indicate that using 10 PCs with an intermediate resolution (0.5) provides a good compromise between capturing biological heterogeneity and avoiding over-fragmentation.*
+
+**Although visual inspection suggests that a slightly higher resolution (e.g. dims = 10, resolution = 0.5) could further subdivide some of the major populations, for consistency with the exercise guidelines, all downstream analyses were performed using the parameter choice of 10 PCs and a clustering resolution of 0.3.**
+
+```{r ARI_UMP, fig.height=8, fig.width=8}
+pbmc <- FindNeighbors(pbmc, dims = 1:10)
+pbmc <- FindClusters(pbmc, resolution = 0.3)
+head(Idents(pbmc), 5)
+pbmc <- RunUMAP(pbmc, dims = 1:10)
+DimPlot(pbmc, reduction = "umap")
+
+
+```
+**Figure 11. UMAP embedding of clustered PBMC3k cells** *UMAP projection of QC-filtered PBMC3k cells using the first 10 principal components and a clustering resolution of 0.3. Each point represents a single cell and colours indicate the unsupervised 7 clusters (0–6). The well-separated groups suggest the presence of distinct transcriptional states, which are used in the following sections for marker-gene identification and cell type annotation.*
+
+# **Part 5:** Marker Detection & Cell Type Annotation
+
+## According to the Example
+
+```{r MARKERS}
+# find markers for every cluster compared to all remaining cells, report only the positive
+# ones
+pbmc.markers <- FindAllMarkers(pbmc, only.pos = TRUE)
+pbmc.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1)
+```
+**Table 2. Cluster-specific marker genes (avg_log2FC > 1)** *Differential expression results for each Seurat cluster compared to all other cells. For every cluster, the table lists genes that are significantly upregulated with an average log₂ fold change greater than 1, together with the corresponding statistics (percentage of expressing cells in the cluster vs. others and adjusted p-values).*
+```{r top MARKERS}
+# TOP markers
+markers_top <- pbmc.markers %>%
+  group_by(cluster) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 1, with_ties = FALSE) %>%
+  ungroup()
+
+markers_top
+```
+**Table 3. Top Differential expression markers per clusters with log₂FC > 1** *When markers were ranked using this simple approach, the top hits included genes such as LZTS2, FCAR, SLC1A7, FAM177B, LYPD2, SCT and LY6G6F. Although these genes show strong statistical enrichment, they are not well-established canonical markers for the main PBMC lineages and often have relatively low detection frequencies, making biological interpretation less straightforward. This motivated the use of another scoring method*
+```{r  simple_dim_plot , fig.height=18, fig.width=18}
+FeaturePlot(pbmc, features = c("LZTS2", "FCAR", "SLC1A7", "FAM177B", "LYPD2", "SCT", "LY6G6F"))
+```
+**Figure 12.UMAP expression of top-ranked non-canonical markers** *Feature plots showing the expression of LZTS2, FCAR, SLC1A7, FAM177B, LYPD2, SCT and LY6G6F across the PBMC UMAP embedding. Although these genes were initially ranked highly by the simple marker-scoring approach, their expression is sparse and not clearly restricted to specific immune populations, and they are not well-established PBMC lineage markers. This lack of clear, biologically interpretable patterns motivated the shift to the composite marker score used later for cell type annotation.*
+
+## Composite Score
+
+```{r composite score}
+pbmc.markers <- FindAllMarkers(
+  pbmc,
+  only.pos = TRUE,
+  test.use = "roc"
+)
+# Build composite score
+markers_scored <- pbmc.markers %>%
+  mutate(spec = pmax(pct.1 - pct.2, 0), # Against Commonly expressed markers 
+         score = avg_log2FC * myAUC * spec)
+
+# Take top 1 per cluster by score
+top1_combined <- markers_scored %>%
+  group_by(cluster) %>%
+  slice_max(order_by = score, n = 1, with_ties = FALSE) %>%
+  arrange(cluster, desc(score)) %>%
+  ungroup()
+
+print(top1_combined)
+```
+**Table 4. Top composite marker gene per cluster** *Table showing, for each cluster, the gene with the highest composite marker score, calculated from a combination of log₂ fold change, ROC AUC and expression specificity (pct.1 − pct.2). Genes are prioritised not only by effect size, but also by how well they discriminate the cluster from the rest. This combined metric yields more biologically relevant, cluster-specific markers (CD3D, S100A8, NKG7, CD79A, FCGR3A, FCER1A, GNG11), which are then used to guide cell type annotation.*
+
+```{r  comp_dim_plot , fig.height=18, fig.width=18}
+FeaturePlot(pbmc, features = c("CD3D", "S100A8", "NKG7", "CD79A", "FCGR3A", "FCER1A", "GNG11"))
+```
+**Figure 13. Marker gene expression across PBMC clusters** *Feature plots showing the normalised expression of key marker genes over the UMAP embedding. CD3D labels Naive CD4 T cells, S100A8 highlights CD14⁺ monocytes, NKG7 marks NK/CD8 T cells, and CD79A is enriched in B cells. FCGR3A identifies CD16⁺ monocytes, FCER1A marks dendritic cells, and GNG11 is specific for platelets. The restricted expression of each gene to its corresponding region in UMAP space supports the final cell type labels assigned to each cluster.*
+
+```{r  UMAP_labeled , fig.height=18, fig.width=14}
+new.cluster.ids <- c("Naive CD4 T", "CD14+ Mono", "NK / CD8 T", "B", "CD16⁺ Monocytes", "Dendritic cells","Platelet")
+names(new.cluster.ids) <- levels(pbmc)
+pbmc <- RenameIdents(pbmc, new.cluster.ids)
+DimPlot(pbmc, reduction = "umap", label = TRUE, pt.size = 0.5) + NoLegend()
+```
+**Figure 14. UMAP embedding of PBMC3k with annotated cell types** *UMAP projection of QC-filtered PBMC3k cells using 10 PCs and a clustering resolution of 0.3, with clusters relabelled according to top marker genes identified by the composite score (combining AUC, log₂ fold change and expression specificity). Distinct regions correspond to Naive CD4 T cells, CD14⁺ monocytes, NK/CD8 T cells, B cells, CD16⁺ monocytes, dendritic cells and platelets. This representation provides an overview of the major immune cell populations captured in the dataset.*
+
+
+```{r Fplots, fig.width=14, fig.height=10}
+VlnPlot(pbmc, features = c("MS4A1", "CCL5","SEPT5"))
+FeaturePlot(pbmc, features = c("MS4A1", "CCL5","SEPT5"))
+```
+**Figure 15. Validation of cluster annotations with additional marker genes** *Violin plots (top) and UMAP feature plots (bottom) showing expression of MS4A1, CCL5 and SEPT5 across the annotated cell types. MS4A1 is almost exclusively expressed in the B-cell cluster, confirming its B-cell identity. CCL5 is strongly enriched in NK/CD8 T cells, consistent with an activated cytotoxic phenotype. SEPT5 shows highly specific expression in the platelet cluster, supporting its use as a platelet-associated marker. Together, these markers provide independent validation of the cell type labels derived from the composite marker score.*
+
+## Results
+
+Feature plots of the top composite markers (CD3D, S100A8, NKG7, CD79A, FCGR3A, FCER1A, GNG11) showed clear, cluster-restricted expression patterns on the UMAP, consistent with Naive CD4 T cells (CD3D), CD14⁺ monocytes (S100A8), NK/CD8 T cells (NKG7), B cells (CD79A), CD16⁺ monocytes (FCGR3A), dendritic cells (FCER1A) and platelets (GNG11). Additional markers such as MS4A1 (B cells), CCL5 (NK/CD8 T cells) and SEPT5 (platelets) displayed lesser but similarly specific expression, further supporting these extra annotations. Overall, even though the chosen clustering parameters (10 PCs, resolution 0.3) were not explicitly optimized for maximal separation  the composite score, allowed for biologically plausible and largely canonical immune cell identities and markers.
